@@ -1,4 +1,5 @@
 from ast import Return
+from sched import scheduler
 import numpy as np
 import PIL
 from PIL import Image
@@ -16,12 +17,12 @@ device=torch.device('cuda')
 import glob
 import zipfile
 import os
-
+import cv2
 torch.cuda.empty_cache()
 
 
-pathoflabel='2_Ortho_RGB/*tif'
-pathofimages='Potsdam/alllabel/*tif'
+pathofimages='2_Ortho_RGB/*tif'
+pathoflabel='Potsdam/alllabel/*tif'
 indexes=[i for i in range(6)]
 colors=[[255,255,255],[0,0,255],[0,255,255],[0,255,0],[255,255,0],[255,0,0]]
 
@@ -43,7 +44,7 @@ def get_train_id(train_path,mask_path):
     train_img_id2=[]
     for i in (train_mask_id):
         for k in (train_img_id):
-            if split(i)[4:6]==split(k)[2:4]:
+            if split(i)[2:4]==split(k)[4:6]:
                 train_mask_id2.append(i)
                 train_img_id2.append(k)
                 
@@ -53,14 +54,15 @@ def get_train_id(train_path,mask_path):
     len_train_val=int(.2*len(train_img_id2))
     for i in range(len_train_val):
         id_label=random.randint(0,len(train_img_id2))
-        val_img_id.append(train_img_id[id_label])
-        val_mask_id.append(train_mask_id[id_label])
+        val_img_id.append(train_img_id2[id_label])
+        val_mask_id.append(train_mask_id2[id_label])
         train_img_id2.pop(id_label)
         train_mask_id2.pop(id_label)
 
     return val_img_id,val_mask_id, train_img_id2,train_mask_id2
 
 val_img_id,val_mask_id,train_img_id,train_mask_id=get_train_id(pathofimages,pathoflabel)
+
 
 class dataset(BaseDataset):
     def __init__(self,img_id,mask_id,indexes,colors,preprocessing=None,datapass=None) :
@@ -73,10 +75,12 @@ class dataset(BaseDataset):
             self.datapass=datapass
     
     def __getitem__(self, index):
-        image=Image.open(self.img_id[index])
-        label=Image.open(self.mask_id[index])
-        image=image.resize((448,448))
-        label=label.resize((448,448))
+        image=cv2.imread(self.img_id[index])
+        image=cv2.cvtColor(image,cv2.COLOR_BGR2RGB)
+        label=cv2.imread(self.mask_id[index])
+        label=cv2.cvtColor(label,cv2.COLOR_BGR2RGB)
+        image=cv2.resize(image,(448,448))
+        label=cv2.resize(label,(448,448))
         label=np.array(label)
         label2=np.zeros(shape=label.shape)
         for i in range(6):
@@ -85,7 +89,7 @@ class dataset(BaseDataset):
         label2=np.expand_dims(label2[:,:,0],axis=-1)
 
         img=(torch.from_numpy(np.array(image))/255.0).type(torch.float32)
-        mask=(torch.from_numpy(label2)).type(torch.LongTensor)
+        mask=(torch.from_numpy(label2)).long()
         img=img.permute(2,0,1)
         mask=mask.permute(2,0,1)
        
@@ -93,7 +97,7 @@ class dataset(BaseDataset):
             if index in indexes:
                 img, mask  = self.preprocessing(img, mask)
         
-        #mask=mask.squeeze(axis=0)
+        mask=mask.squeeze(axis=0)
     
         return img,mask
 
@@ -123,7 +127,6 @@ augmentedval2=dataset(val_img_id,val_mask_id,indexes,colors,augmen2())
 augmentedval3=dataset(val_img_id,val_mask_id,indexes,colors,augmen4())
 
 
-
 all_items=[]
 alldata=return_all_items(data,all_items)
 alldata=return_all_items(augmenteddata,alldata)
@@ -135,57 +138,62 @@ allval=return_all_items(val,all_items)
 allval=return_all_items(augmentedval,allval)
 allval=return_all_items(augmentedval2,allval)
 allval=return_all_items(augmentedval3,allval)
-print(len(alldata),len(allval))
 
 train_loader = DataLoader(alldata, batch_size=8,num_workers=8,shuffle=True)
 val_loader = DataLoader(allval, batch_size=8,num_workers=1,shuffle=True)
-imgtest,labeltest=next(iter(train_loader))
-print(imgtest.shape,labeltest.shape)
+train_histogram=[]
+for i in alldata:
+    train_histogram.append(np.array(i[1]))
 
-print(imgtest.shape,labeltest.shape)
+train_histogram,x=np.histogram(train_histogram, bins=[i for i in range(7)], range=7)
 
-loss = seg.utils.losses.DiceLoss()
+print(train_histogram)
+weight=torch.from_numpy(np.array([1-(x/sum(train_histogram)) for x in train_histogram])).float()
+print(weight)
 
-matrices=[seg.utils.metrics.IoU(threshold=0.5)]
+los = nn.CrossEntropyLoss(weight.to('cuda'))
 
 model=seg.UnetPlusPlus(encoder_name='resnet18',in_channels=3,encoder_weights='imagenet',classes=6,activation=None).to('cuda')
-
 optimizer = torch.optim.Adam([ 
     dict(params=model.parameters(), lr=0.001),
 ])
-train_epoch = seg.utils.train.TrainEpoch(
-    model, 
-    loss=loss, 
-    metrics=matrices, 
-    optimizer=optimizer,
-    device='cuda',
-  
-    verbose=True,
-)
+scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.01, 
+patience=6,verbose=True)
 
-valid_epoch = seg.utils.train.ValidEpoch(
-    model, 
-    loss=loss, 
-    metrics=matrices, 
-    device='cuda',
-    
-    verbose=True,
-)
+val_loss_min=100
+def Train_one_epoch():
+    train_loss=0
+    for image, mask in train_loader:
+        optimizer.zero_grad()
+        image=image.to('cuda')
+        mask=mask.to('cuda')
+        res=model(image)
+        loss=los(res,mask)
+        loss.backward()
+        optimizer.step()
+        train_loss+= loss.item()*image.size(0)
+    return train_loss/len(train_loader.sampler)
+def val_one_epoch():
+    val_loss=0
+    for image, mask in val_loader:
+        image=image.to('cuda')
+        mask=mask.to('cuda')
+        res=model(image)
+        loss=los(res,mask)
+        val_loss+= loss.item()*image.size(0)
+    return res,val_loss/len(val_loader.sampler)
 
+for i in range(200):
+    train_loss=Train_one_epoch()
+    res,val_loss=val_one_epoch()
+    scheduler.step(val_loss)
 
-
-max_score=0
-for i in range(100):
-  print('epoch {}'.format(i))
-  train_res=train_epoch.run(train_loader)
-  val_res=valid_epoch.run(val_loader)
-  if i == 25:
-        optimizer.param_groups[0]['lr'] = 1e-4
-  if i == 80:
-        optimizer.param_groups[0]['lr'] = 1e-8
-  
-  if max_score<val_res['iou_score']:
-      max_score=val_res['iou_score']
-      torch.save(model, 'best_model2.pth')
+    if val_loss<val_loss_min:
+        val_loss_min=val_loss
+        torch.save(model,'saved_model.pth')
+        if val_loss_min<0.3:
+            torchvision.utils.save_image(torch.argmax(res,dim=-1),'images/{}'.format(i+1))
+    if (i+1)%5==0:
+        print('epoch= {},  train_loss= {},  val_loss= {}'.forma(i+1,train_loss,val_loss))
 
 
