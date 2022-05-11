@@ -116,7 +116,7 @@ class augmen2():
         return TF.rotate(img,angel),TF.rotate(mask,angel)
 
 
-indexes=[random.randint(0,30) for i in range(15)]
+indexes=[random.randint(0,30) for i in range(12)]
 data=dataset(train_img_id,train_mask_id,indexes,colors,None)
 augmenteddata=dataset(train_img_id,train_mask_id,indexes,colors,augmen())
 augmenteddata2=dataset(train_img_id,train_mask_id,indexes,colors,augmen2())
@@ -140,25 +140,24 @@ allval=return_all_items(augmentedval2,allval)
 allval=return_all_items(augmentedval3,allval)
 
 train_loader = DataLoader(alldata, batch_size=8,num_workers=8,shuffle=True)
-val_loader = DataLoader(allval, batch_size=8,num_workers=1,shuffle=True)
+val_loader = DataLoader(allval, batch_size=6,num_workers=1,shuffle=True)
 train_histogram=[]
 for i in alldata:
     train_histogram.append(np.array(i[1]))
 
 train_histogram,x=np.histogram(train_histogram, bins=[i for i in range(7)], range=7)
-
-print(train_histogram)
 weight=torch.from_numpy(np.array([1-(x/sum(train_histogram)) for x in train_histogram])).float()
-print(weight)
+
 
 los = nn.CrossEntropyLoss(weight.to('cuda'))
 
 model=seg.UnetPlusPlus(encoder_name='resnet18',in_channels=3,encoder_weights='imagenet',classes=6,activation=None).to('cuda')
+model=torch.load('saved_model.pth')
 optimizer = torch.optim.Adam([ 
-    dict(params=model.parameters(), lr=0.001),
+    dict(params=model.parameters(), lr=0.01),
 ])
-scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.01, 
-patience=6,verbose=True)
+scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, 
+patience=6,min_lr=0.0001,verbose=True)
 
 val_loss_min=100
 def Train_one_epoch():
@@ -183,7 +182,7 @@ def val_one_epoch():
         val_loss+= loss.item()*image.size(0)
     return res,val_loss/len(val_loader.sampler)
 
-for i in range(200):
+for i in range(100):
     train_loss=Train_one_epoch()
     res,val_loss=val_one_epoch()
     scheduler.step(val_loss)
@@ -193,7 +192,8 @@ for i in range(200):
         torch.save(model,'saved_model.pth')
         if val_loss_min<0.3:
             torchvision.utils.save_image(torch.argmax(res,dim=-1),'images/{}'.format(i+1))
+            break
     if (i+1)%5==0:
-        print('epoch= {},  train_loss= {},  val_loss= {}'.forma(i+1,train_loss,val_loss))
+        print('epoch= {},  train_loss= {},  val_loss= {}'.format(i+1,train_loss,val_loss))
 
 
