@@ -13,13 +13,12 @@ import glob
 import segmentation_models_pytorch as seg 
 from torch import nn as nn
 import random
-device=torch.device('cuda')
 import glob
 import zipfile
 import os
 import cv2
-torch.cuda.empty_cache()
 
+#device = torch.device('cuda')
 
 pathofimages='2_Ortho_RGB/*tif'
 pathoflabel='Potsdam/alllabel/*tif'
@@ -62,7 +61,6 @@ def get_train_id(train_path,mask_path):
     return val_img_id,val_mask_id, train_img_id2,train_mask_id2
 
 val_img_id,val_mask_id,train_img_id,train_mask_id=get_train_id(pathofimages,pathoflabel)
-
 
 class dataset(BaseDataset):
     def __init__(self,img_id,mask_id,indexes,colors,preprocessing=None,datapass=None) :
@@ -139,27 +137,51 @@ allval=return_all_items(augmentedval,allval)
 allval=return_all_items(augmentedval2,allval)
 allval=return_all_items(augmentedval3,allval)
 
-train_loader = DataLoader(alldata, batch_size=8,num_workers=8,shuffle=True)
-val_loader = DataLoader(allval, batch_size=6,num_workers=1,shuffle=True)
+train_loader = DataLoader(alldata, batch_size=16,num_workers=12,shuffle=True)
+val_loader = DataLoader(allval, batch_size=8,num_workers=4,shuffle=True)
 train_histogram=[]
 for i in alldata:
     train_histogram.append(np.array(i[1]))
 
-train_histogram,x=np.histogram(train_histogram, bins=[i for i in range(7)], range=7)
-weight=torch.from_numpy(np.array([1-(x/sum(train_histogram)) for x in train_histogram])).float()
 
+
+train_histogram,x=np.histogram(train_histogram, bins=[i for i in range(7)], range=7)
+weight=torch.from_numpy(np.array([(sum(train_histogram)/x) for x in train_histogram])).float()
+weight/=weight.max()
+
+print(len(val_loader),weight)
+
+
+smooth_factor=0.00001
+def IoU(pred,true):
+    classwise_IoU=[]
+    pred=torch.argmax(pred,dim=1)
+    pred=torch.squeeze(pred,dim=1)
+    for i in range(6):
+        intersection=torch.sum((pred==i)*(true==i)).int()
+        true_area=torch.sum(true==i).int()
+        pred_area=torch.sum(pred==i).int()
+        compinde_area=true_area+pred_area
+        iou=(intersection+smooth_factor)/(true_area+pred_area-intersection+smooth_factor)
+        classwise_IoU.append(iou)
+
+    return torch.sum(torch.tensor(classwise_IoU))/len(classwise_IoU)
 
 los = nn.CrossEntropyLoss(weight.to('cuda'))
 
-model=seg.UnetPlusPlus(encoder_name='resnet18',in_channels=3,encoder_weights='imagenet',classes=6,activation=None).to('cuda')
-model=torch.load('saved_model.pth')
+model=seg.UnetPlusPlus(encoder_name='resnext101_32x8d',in_channels=3,encoder_weights='imagenet',classes=6,activation=None)
+model=nn.DataParallel(model).to('cuda')
+
+
+
+#model=torch.load('saved_model.pth')
 optimizer = torch.optim.Adam([ 
     dict(params=model.parameters(), lr=0.01),
 ])
-scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, 
-patience=6,min_lr=0.0001,verbose=True)
+scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, 
+patience=6,min_lr=0.001,verbose=True)
 
-val_loss_min=100
+IoU_score=0
 def Train_one_epoch():
     train_loss=0
     for image, mask in train_loader:
@@ -167,6 +189,7 @@ def Train_one_epoch():
         image=image.to('cuda')
         mask=mask.to('cuda')
         res=model(image)
+        
         loss=los(res,mask)
         loss.backward()
         optimizer.step()
@@ -174,26 +197,27 @@ def Train_one_epoch():
     return train_loss/len(train_loader.sampler)
 def val_one_epoch():
     val_loss=0
+    mean_IoU=0
     for image, mask in val_loader:
         image=image.to('cuda')
         mask=mask.to('cuda')
         res=model(image)
-        loss=los(res,mask)
-        val_loss+= loss.item()*image.size(0)
-    return res,val_loss/len(val_loader.sampler)
+        mean_IoU+=IoU(res,mask)
+    return res,mean_IoU/len(val_loader)
 
-for i in range(100):
+for i in range(60):
     train_loss=Train_one_epoch()
-    res,val_loss=val_one_epoch()
-    scheduler.step(val_loss)
+    res,mean_IoU=val_one_epoch()
+    scheduler.step(mean_IoU)
+    print(i)
 
-    if val_loss<val_loss_min:
-        val_loss_min=val_loss
+    if mean_IoU>IoU_score:
+        IoU_score=mean_IoU
         torch.save(model,'saved_model.pth')
-        if val_loss_min<0.3:
+        if IoU_score>0.8:
             torchvision.utils.save_image(torch.argmax(res,dim=-1),'images/{}'.format(i+1))
             break
     if (i+1)%5==0:
-        print('epoch= {},  train_loss= {},  val_loss= {}'.format(i+1,train_loss,val_loss))
+        print('epoch= {},  train_loss= {},  mean_IoU= {}'.format(i+1,train_loss,mean_IoU))
 
 
